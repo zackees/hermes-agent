@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import os
 import shlex
 import sys
@@ -24,13 +25,16 @@ from typing import Any, Callable, Dict, Optional
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
-    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
+    GATEWAY_SERVICE_RESTART_EXIT_CODE,
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
-from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+from gateway.shutdown_watchdog import (
+    DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S, arm_shutdown_watchdog, resolve_shutdown_watchdog_delay,
+)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -1686,6 +1690,26 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
         self._mark_api_runs_shutdown_requested()
 
+        # The stop() watchdog starts too late to cover a stalled after-turn wait. Arm an
+        # independent OS-thread deadline now, before scheduling any more asyncio work.
+        # A supervisor must own recovery: a hard exit cannot relaunch an unmanaged gateway.
+        restart_done = threading.Event()
+        if ((via_service or os.environ.get("HERMES_SUPERVISED_CHILD") == "1")
+                and not os.environ.get("PYTEST_CURRENT_TEST")):
+            wait_timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
+            if not math.isfinite(wait_timeout):
+                wait_timeout = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+            stop_leash = _effective_watchdog_leash(self)
+            if not math.isfinite(stop_leash):
+                stop_leash = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
+            arm_shutdown_watchdog(
+                max(0.0, wait_timeout) + max(0.0, stop_leash),
+                done_event=restart_done,
+                snapshot_fn=lambda: {"phase": "restart_wait", "restart_requested": True},
+                exit_code=GATEWAY_SERVICE_RESTART_EXIT_CODE,
+                name="gateway-restart-watchdog",
+            )
+
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
@@ -1694,6 +1718,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     await self._launch_detached_restart_command()
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            # Keep the deadline armed on cancellation or failure: otherwise a failed restart
+            # task would strand the live gateway in draining permanently.
+            restart_done.set()
 
         # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
         # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in
