@@ -3332,6 +3332,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 
 
 from gateway.run_runtime_init import GatewayRuntimeInitMixin
+from gateway.run_consent import GatewayConsentMixin
 
 
 class GatewayRunner(
@@ -3339,7 +3340,8 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAgentCacheMixin, GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
+    GatewayConsentMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     def _adapter_for_source(self, source):
