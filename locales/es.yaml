@@ -956,6 +956,19 @@ gateway:
     hint: "Recarga y gestiona la facturación en el navegador — tu saldo se actualizará aquí después."
   login:
     free_tier_remaining: "\nAlgunos chats siguen en el nivel gratuito; usa /model en esos chats para cambiar."
+  consent:
+    header: Root access requested — one command, one run
+    reason_label: Why
+    approve: Approve once
+    deny: Deny
+    approved: Approved
+    denied: Denied
+    already: Already answered
+    already_detail: This request was already answered; nothing changed.
+    refused: 'Refused: {reason}'
+    not_approver: Only the configured approver can answer this request.
+    resolved_approved: ✅ Approved by {user} — valid for one run, then it expires.
+    resolved_denied: ⛔ Denied by {user} — the command will not run.
 platform:
   whatsapp:
     clarify_other_title: "✏️ Otra"

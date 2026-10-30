@@ -2868,6 +2868,19 @@ class BasePlatformAdapter(ABC):
         """Render ``prompt`` with the platform's native buttons; the default has none."""
         return SendResult(success=False, error="Not supported")
 
+    async def send_consent_approval(
+        self, chat_id: str, request_id: str, command: str, reason: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Consent-gated-sudo approval card for one agent request (``~/.hermes/consent/<id>.json``).
+
+        Button-capable adapters override this and MUST route the tap to
+        ``gateway.consent_approvals.record_decision`` with the callback's real update/message ids —
+        the tap, not the agent, is what writes ``<id>.approved``. The default renders nothing: a
+        text-only confirmation with no button would invite a tap the gateway cannot attribute.
+        """
+        return SendResult(success=False, error="Not supported")
+
     @staticmethod
     def _format_choice_page(options: list, page: int, per_page: int) -> tuple[list, dict[str, Any]]:
         """Shared picker pagination: clamp ``page``, slice ``options`` -> ``(page_options, meta)``

@@ -4264,6 +4264,77 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(prompt.metadata), reply_to_mode=self._reply_to_mode)
 
+    async def send_consent_approval(
+        self, chat_id: str, request_id: str, command: str, reason: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Card for one consent-gated root request; ``ca:approve|deny:<request_id>`` buttons.
+
+        Deliberately carries no session key and no in-memory pending entry: the tap is decided
+        entirely by the ``.json`` request on disk, so a gateway restart between card and tap
+        neither loses the request nor resurrects a stale approval.
+        """
+        def build():
+            text = (
+                f"🔐 <b>{_html.escape(t('gateway.consent.header'))}</b>\n\n"
+                f"<pre>{_html.escape(command)}</pre>\n\n"
+                f"<b>{_html.escape(t('gateway.consent.reason_label'))}:</b> {_html.escape(reason)}")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(t("gateway.consent.approve"), callback_data=f"ca:approve:{request_id}"),
+                InlineKeyboardButton(t("gateway.consent.deny"), callback_data=f"ca:deny:{request_id}")]])
+            return text, keyboard, None
+        return await self._send_prompt(
+            "send_consent_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+
+    async def _handle_consent_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        """``ca:<approve|deny>:<request_id>`` — the gateway records the human's consent tap.
+
+        Two gates before anything is written: the platform/global allowlist every other button
+        obeys (``_callback_authorized``), and the root config's single approver id. A stranger's
+        tap answers a refusal and leaves the consent directory untouched.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            return
+        action, request_id = parts[1], parts[2]
+        if action not in ("approve", "deny"):
+            await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
+            return
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        from gateway import consent_approvals
+        approver_id = getattr(query.from_user, "id", None)
+        if not consent_approvals.is_authorized_approver(approver_id):
+            logger.warning(
+                "[%s] refused consent tap for %s: user %s is not the configured approver",
+                self.name, request_id, approver_id)
+            await query.answer(text=_toast("gateway.consent.not_approver"))
+            return
+        try:
+            path = consent_approvals.record_decision(
+                action, request_id, approver_id=approver_id,
+                update_id=cb.get("update_id"), message_id=cb.get("message_id"))
+        except consent_approvals.ConsentRefused as exc:
+            logger.warning("[%s] consent %s for %s refused: %s", self.name, action, request_id, exc)
+            await query.answer(text=_toast("gateway.consent.refused", reason=str(exc)))
+            await self._edit_html_quiet(query, _html.escape(t("gateway.consent.refused", reason=str(exc))))
+            return
+        user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        if path is None:
+            label = t("gateway.consent.already")
+            edit_text = _html.escape(t("gateway.consent.already_detail"))
+        elif action == "approve":
+            label = t("gateway.consent.approved")
+            edit_text = _html.escape(t("gateway.consent.resolved_approved", user=user_display))
+            logger.info("[%s] consent approval recorded for %s by %s", self.name, request_id, approver_id)
+        else:
+            label = t("gateway.consent.denied")
+            edit_text = _html.escape(t("gateway.consent.resolved_denied", user=user_display))
+            logger.info("[%s] consent denial recorded for %s by %s", self.name, request_id, approver_id)
+        await query.answer(text=label[:_TOAST_LIMIT])
+        await self._edit_html_quiet(query, edit_text)
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -4689,13 +4760,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.debug("[%s] inline picker answer failed", self.name, exc_info=True)
 
     @staticmethod
-    def _callback_ctx(query) -> dict[str, Any]:
-        """Chat/thread/user context of a button tap, for the callback auth gate."""
+    def _callback_ctx(query, update=None) -> dict[str, Any]:
+        """Chat/thread/user context of a button tap, for the callback auth gate.
+
+        ``update_id`` / ``message_id`` are the tap's own Telegram ids: a consent approval must
+        record the update the person actually pressed, not ids the caller supplied.
+        """
         query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
         return {
             "chat_id": getattr(query_message, "chat_id", None), "chat_type": getattr(query_chat, "type", None),
-            "thread_id": getattr(query_message, "message_thread_id", None), "user_name": getattr(query.from_user, "first_name", None)}
+            "thread_id": getattr(query_message, "message_thread_id", None), "user_name": getattr(query.from_user, "first_name", None),
+            "update_id": getattr(update, "update_id", None) if update is not None else None,
+            "message_id": getattr(query_message, "message_id", None)}
 
     async def _callback_authorized(self, query, cb: dict[str, Any], denial_text: str) -> bool:
         """Gate a button tap on the callback allowlist; answers ``denial_text`` when refused."""
@@ -4714,7 +4791,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         self._accept_update()
         data = query.data
-        cb = self._callback_ctx(query)
+        cb = self._callback_ctx(query, update)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
@@ -4727,6 +4804,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 return
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
+            ("ca:", self._handle_consent_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):

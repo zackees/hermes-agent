@@ -956,6 +956,19 @@ gateway:
     hint: "チャージと請求の管理はブラウザで行ってください — 完了後、ここの残高が更新されます。"
   login:
     free_tier_remaining: "\n一部のチャットはまだ無料プランのままです。それらのチャットでは /model で切り替えてください。"
+  consent:
+    header: Root access requested — one command, one run
+    reason_label: Why
+    approve: Approve once
+    deny: Deny
+    approved: Approved
+    denied: Denied
+    already: Already answered
+    already_detail: This request was already answered; nothing changed.
+    refused: 'Refused: {reason}'
+    not_approver: Only the configured approver can answer this request.
+    resolved_approved: ✅ Approved by {user} — valid for one run, then it expires.
+    resolved_denied: ⛔ Denied by {user} — the command will not run.
 platform:
   whatsapp:
     clarify_other_title: "✏️ その他"

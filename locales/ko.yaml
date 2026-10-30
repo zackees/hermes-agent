@@ -956,6 +956,19 @@ gateway:
     hint: "브라우저에서 충전과 결제 관리를 하면 잔액이 여기에도 곧 반영돼요."
   login:
     free_tier_remaining: "\n일부 채팅은 아직 무료 등급을 사용 중이에요. 해당 채팅에서 /model로 전환하세요."
+  consent:
+    header: Root access requested — one command, one run
+    reason_label: Why
+    approve: Approve once
+    deny: Deny
+    approved: Approved
+    denied: Denied
+    already: Already answered
+    already_detail: This request was already answered; nothing changed.
+    refused: 'Refused: {reason}'
+    not_approver: Only the configured approver can answer this request.
+    resolved_approved: ✅ Approved by {user} — valid for one run, then it expires.
+    resolved_denied: ⛔ Denied by {user} — the command will not run.
 platform:
   whatsapp:
     clarify_other_title: "✏️ 기타"
