@@ -64,6 +64,11 @@ A few tool behaviors are worth knowing when you read agent transcripts:
 - **Signal deaths are explained.** When a terminal command is killed by a signal, the result carries a human-readable note instead of a bare numeric code — e.g. exit `-9`/`137` becomes "terminated by signal 9: SIGKILL — often the kernel OOM killer on memory exhaustion, or an explicit kill -9", and segfaults, aborts, SIGTERM, broken pipes, and CPU/file-size limits are labeled the same way. Negative codes (subprocess semantics) are stated definitively; the shell's `128+signum` convention is hedged with "usually" since an application can legitimately exit with those codes.
 - **UTF-16 text files are transcoded, not refused.** `read_file` detects UTF-16 (BOM or byte-pattern heuristic, either endianness — common for Windows Notepad files and PowerShell `>` redirects) and transcodes it to UTF-8 for display instead of flagging the file as binary. The result includes a hint disclosing the conversion; edits via `patch`/`write_file` re-encode as UTF-8. Files over 10 MB and genuinely binary files still get the binary-file refusal.
 
+### Pitfalls: tool-output shapes that spiral
+
+- **A partial read never licenses `write_file`.** `write_file` refuses to overwrite an existing file unless this task has seen every line of its current content, in one read or by paging through all of it. Re-reading the same `offset`/`limit` window adds no coverage, so it can never lift the refusal. The refusal lists `unread_ranges` and names the one read that clears it (usually `read_file` with no `offset`/`limit`), and partial reads come back with a `_write_precondition` note. For a small change, use `patch` instead.
+- **Bound every listing before it reaches the transcript.** An unbounded `find … | xargs grep`/`sed` over a tree that holds `.pyc`, images or other binaries dumps raw bytes into context and pushes the session toward compression. Use `search_files` (it skips binaries), or add `-name '*.py'`, `grep -I`, `--exclude-dir=__pycache__` and a `| head -n 200` cap.
+
 ## Terminal Backends
 
 The terminal tool can execute commands in different environments:

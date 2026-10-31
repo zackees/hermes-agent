@@ -379,6 +379,31 @@ def _note_read_coverage(task_data: dict, resolved: str, version: tuple, start: i
     return complete, entry["redacted"]
 
 
+def _unread_line_ranges(resolved: str, task_id: str) -> tuple[list[list[int]], int] | None:
+    """``([[start, end], ...], total_lines)``: the 1-based line ranges of the CURRENT
+    *resolved* content this task has not read, so a write_file refusal can name the exact
+    read that lifts it (re-reading the same window never does). Pages taken at an older
+    version count as unread. ``None`` when the file cannot be read."""
+    version = _file_version(resolved)
+    try:
+        with open(resolved, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    total = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+    with _read_tracker_lock:
+        entry = (_read_tracker.get(task_id) or {}).get("read_coverage", {}).get(str(resolved))
+        seen = list(entry["ranges"]) if entry and entry["version"] == version else []
+    gaps, nxt = [], 1
+    for s, e in seen:
+        if s > nxt:
+            gaps.append([nxt, min(s - 1, total)])
+        nxt = max(nxt, e + 1)
+    if nxt <= total:
+        gaps.append([nxt, total])
+    return [g for g in gaps if g[0] <= g[1]], total
+
+
 def _read_mtime_drifted(filepath: str, task_id: str) -> bool:
     """True when the file's mtime changed since this task last read it. False when
     never read, fresh, or unstattable (a deleted file is the write's problem)."""
