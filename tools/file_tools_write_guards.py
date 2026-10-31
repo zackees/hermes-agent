@@ -24,7 +24,8 @@ from tools.binary_extensions import (
 )
 from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
-from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
+from tools.file_tools_read_tracking import (
+    _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted, _unread_line_ranges)
 import itertools
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
@@ -594,13 +595,44 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         "disk content.")
 
 
-def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None) -> dict:
+_ONE_PAGE_LINES = 2000  # read_file's per-call line maximum
+
+
+def _unread_hint(filepath: str, gaps: list[list[int]], total: int) -> str:
+    """One sentence naming the read that lifts the refusal. Without it an agent re-issues
+    the same offset/limit window, the coverage never grows, and write_file refuses again."""
+    if not gaps:
+        return ""
+    spans = ", ".join(f"{s}-{e}" for s, e in gaps[:8]) + (" ..." if len(gaps) > 8 else "")
+    if total <= _ONE_PAGE_LINES:
+        fix = (f"call read_file with no offset/limit on {filepath} ({total} lines, one page) "
+               "and then retry write_file once")
+    else:
+        fix = "read each of those ranges with read_file offset/limit, then retry write_file"
+    return (f" Unread lines of the current file: {spans} of {total}. Re-reading a window you "
+            f"already saw will NOT lift this; {fix}.")
+
+
+def _annotate_write_precondition(result_dict: dict, resolved: str, task_id: str) -> None:
+    """Tell the model, on the read itself, when its view does not yet permit write_file —
+    so a partial read is never mistaken for the precondition the next overwrite needs."""
+    if not _has_full_write_baseline(resolved, task_id):
+        result_dict["_write_precondition"] = (
+            "Partial view: this does NOT let write_file overwrite the file. Use patch for targeted "
+            "edits, or read the remaining lines first (read_file with no offset/limit for a file "
+            f"of at most {_ONE_PAGE_LINES} lines).")
+
+
+def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None,
+                         task_id: str | None = None) -> dict:
     """Model-facing refusal payload for write_file; ``stale_write_blocked`` lets
-    callers tell it apart from I/O errors."""
+    callers tell it apart from I/O errors, ``unread_ranges`` names what is still unseen."""
+    unread = _unread_line_ranges(resolved, task_id) if resolved and task_id else None
+    hint = _unread_hint(filepath, *unread) if unread else ""
     result = {
         "error": (
             f"Refusing to overwrite {filepath}: {reason} "
-            "The file was NOT modified. Reload the current contents with read_file "
+            f"The file was NOT modified.{hint} Reload the current contents with read_file "
             "(every page, for a file that needs offset/limit), merge the requested "
             "change, then call write_file again. For small edits, prefer patch so "
             "existing unrelated changes are preserved."),
@@ -609,6 +641,8 @@ def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None
     }
     if resolved:
         result["resolved_path"] = resolved
+    if unread:
+        result["unread_ranges"] = unread[0]
     return result
 
 

@@ -34,12 +34,14 @@ from tools.file_tools_paths import (
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
+    _annotate_write_precondition, _is_internal_file_tool_content, _stale_overwrite_blocker,
+    _stale_write_refusal)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
     _check_not_found_cache, _known_full_content_sha256,
     _file_metadata, _file_version,
-    _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
+    _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage,
+    _patch_failure_lock,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
 
@@ -739,6 +741,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                                         end_line=end_line, total_lines=total_lines,
                                         version_before=version_before,
                                         snapshot=getattr(result, "_snapshot", None))
+        _annotate_write_precondition(result_dict, resolved_str, task_id)
         if count >= 4:
             return tool_error(
                 f"BLOCKED: You have read this exact file region {count} times in a row. "
@@ -896,7 +899,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # warning after the clobber (#65604). Nothing below runs.
             blocker = _stale_overwrite_blocker(path, _resolved, task_id)
             if blocker:
-                return json.dumps(_stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
+                return json.dumps(_stale_write_refusal(path, blocker, _resolved, task_id), ensure_ascii=False)
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
             result = _get_file_ops(task_id).write_file(_resolved or path, content)
