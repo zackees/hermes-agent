@@ -330,22 +330,23 @@ import {
   disableGpuSwitchNeededForReason,
   LINUX_GPU_SILENT_RETRY_GRACE_S,
   linuxGpuChildDeathPath,
-  linuxGpuFallbackMarker,
-  linuxGpuMarkerAfterSuccessfulBoot,
-  readLinuxGpuMarker,
-  shouldEngageSilentGpuRetryFallback,
-  writeLinuxGpuMarker
+  removeLegacyLinuxGpuMarker,
+  shouldEngageSilentGpuRetryFallback
 } from './linux-gpu-fallback'
+import {
+  compactLedger,
+  createLaunchRecorder,
+  decideFromLedger,
+  readLedger,
+  summarizeLaunches
+} from './linux-gpu-launch-ledger'
 import { notifyLauncherWindowRevealed } from './linux-launcher-ready'
 import {
   decideNvidiaEglFallback,
-  nvidiaEglFallbackMarker,
-  nvidiaEglMarkerAfterSuccessfulBoot,
   parseNvidiaDriverMajor,
   parseNvidiaDriverVersion,
-  readNvidiaEglMarker,
-  shouldRelaunchForNvidiaGpuDeath,
-  writeNvidiaEglMarker
+  removeLegacyNvidiaEglMarker,
+  shouldRelaunchForNvidiaGpuDeath
 } from './linux-nvidia-egl-fallback'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
 import { resolveIpcFileReadPath, resolveMediaStreamFile, resolvePreviewTargetPath } from './local-read-path'
@@ -884,11 +885,52 @@ const NVIDIA_DRIVER_VERSION = parseNvidiaDriverVersion(NVIDIA_PROC_VERSION)
 let nvidiaEglFallbackActive = false
 let nvidiaEglRelaunchAttempted = false
 
+// talos-hq/hermes-slim#6: cross-launch GPU evidence lives in an append-only
+// launch ledger (start / revealed / gpu-death / second-instance / clean-exit),
+// not a single-slot `booting` marker. A launch that revealed its window is
+// healthy even if it is later force-killed; only witnessed GPU deaths or a
+// rapid pre-reveal boot loop engage software rendering, and software mode
+// re-probes hardware GL with backoff. The legacy markers are deleted so hosts
+// wedged by them recover on upgrade.
+const GPU_LEDGER_USER_DATA = app.getPath('userData')
+
+const GPU_LAUNCH_LEDGER_DECISION = (() => {
+  if (process.platform !== 'linux') {
+    return null
+  }
+
+  const events = readLedger(GPU_LEDGER_USER_DATA)
+
+  try {
+    compactLedger(GPU_LEDGER_USER_DATA, events)
+  } catch {
+    void 0
+  }
+
+  removeLegacyNvidiaEglMarker(GPU_LEDGER_USER_DATA)
+  removeLegacyLinuxGpuMarker(GPU_LEDGER_USER_DATA)
+
+  return decideFromLedger(summarizeLaunches(events), Date.now())
+})()
+
+// An empty dir makes every append a no-op off Linux.
+const gpuLaunchRecorder = createLaunchRecorder(process.platform === 'linux' ? GPU_LEDGER_USER_DATA : '')
+
+/** Set at the first window reveal; GPU deaths long after it are not boot evidence. */
+let gpuBootRevealedAt: number | null = null
+
+/** GPU child deaths this long after the first reveal are runtime noise (suspend, driver reset), not a broken GPU. */
+const GPU_DEATH_EVIDENCE_WINDOW_MS = 60_000
+
+function gpuDeathCountsAsEvidence(): boolean {
+  return gpuBootRevealedAt === null || Date.now() - gpuBootRevealedAt <= GPU_DEATH_EVIDENCE_WINDOW_MS
+}
+
 const NVIDIA_EGL_FALLBACK = decideNvidiaEglFallback({
   driverMajor: NVIDIA_DRIVER_MAJOR,
-  driverVersion: NVIDIA_DRIVER_VERSION,
-  marker: readNvidiaEglMarker(app.getPath('userData')),
-  appVersion: app.getVersion(),
+  ledger: process.argv.includes('--use-angle=swiftshader')
+    ? { software: true, reason: 'relaunched after a GPU-process death' }
+    : GPU_LAUNCH_LEDGER_DECISION,
   env: process.env,
   platform: process.platform,
   isWsl: IS_WSL,
@@ -897,24 +939,12 @@ const NVIDIA_EGL_FALLBACK = decideNvidiaEglFallback({
 
 nvidiaEglFallbackActive = NVIDIA_EGL_FALLBACK.enable
 
-// Persist the launch decision before GPU children start: a `booting` marker
-// left behind by a launch that never reached first paint is itself evidence
-// of a GPU death (the "GPU process isn't usable" FATAL abort wins the race
-// against our relaunch handler), and the next launch engages from it.
-if (NVIDIA_DRIVER_MAJOR !== null) {
-  try {
-    writeNvidiaEglMarker(app.getPath('userData'), NVIDIA_EGL_FALLBACK.nextMarker)
-  } catch {
-    void 0
-  }
-}
-
 if (NVIDIA_EGL_FALLBACK.enable) {
   app.commandLine.appendSwitch('use-angle', 'swiftshader')
   console.log(
     `[hermes] NVIDIA EGL fallback enabled (${NVIDIA_EGL_FALLBACK.reason}); routing ANGLE ` +
-      'through SwiftShader. Witnessed GPU-process death probe (#40077, #124255); an app or ' +
-      'driver update re-probes hardware GL once. HERMES_DESKTOP_NVIDIA_SWIFTSHADER=0 to opt out.'
+      'through SwiftShader (#40077, #124255). Hardware GL is re-probed with backoff ' +
+      '(talos-hq/hermes-slim#6). HERMES_DESKTOP_NVIDIA_SWIFTSHADER=0 to opt out.'
   )
 }
 
@@ -935,16 +965,17 @@ if (NVIDIA_DRIVER_MAJOR !== null && process.platform === 'linux') {
       return
     }
 
-    nvidiaEglRelaunchAttempted = true
-
-    try {
-      writeNvidiaEglMarker(
-        app.getPath('userData'),
-        nvidiaEglFallbackMarker(app.getVersion(), NVIDIA_DRIVER_VERSION ?? String(NVIDIA_DRIVER_MAJOR))
+    if (!gpuDeathCountsAsEvidence()) {
+      console.warn(
+        `[hermes] NVIDIA GPU process gone long after boot (reason=${details?.reason}); ` +
+          'leaving recovery to Chromium, not recording fallback evidence'
       )
-    } catch {
-      void 0
+
+      return
     }
+
+    nvidiaEglRelaunchAttempted = true
+    gpuLaunchRecorder.record('gpu-death', { reason: String(details?.reason ?? ''), exitCode: details?.exitCode })
 
     console.warn(
       `[hermes] NVIDIA GPU process died (reason=${details?.reason}, exit=${details?.exitCode}); ` +
@@ -977,25 +1008,17 @@ const LINUX_GPU_SOFTWARE_ACTIVE =
   Boolean(REMOTE_DISPLAY_REASON) || NVIDIA_EGL_FALLBACK.enable || alreadyHasDisableGpu(process.argv, process.env)
 
 if (process.platform === 'linux') {
-  const linuxGpuUserData = app.getPath('userData')
-
   const linuxGpuDecision = decideLinuxGpuLaunch({
     argv: process.argv,
     env: process.env,
-    marker: readLinuxGpuMarker(linuxGpuUserData),
-    appVersion: app.getVersion(),
+    // NVIDIA hosts take the ANGLE ladder above; the ledger drives only one ladder.
+    ledger: NVIDIA_DRIVER_MAJOR === null ? GPU_LAUNCH_LEDGER_DECISION : null,
     remoteDisplayReason: REMOTE_DISPLAY_REASON,
     nvidiaFallbackActive: NVIDIA_EGL_FALLBACK.enable
   })
 
   linuxGpuFallbackActive = linuxGpuDecision.enable
-  linuxGpuFallbackSticky = linuxGpuDecision.nextMarker.state === 'fallback'
-
-  try {
-    writeLinuxGpuMarker(linuxGpuUserData, linuxGpuDecision.nextMarker)
-  } catch {
-    void 0
-  }
+  linuxGpuFallbackSticky = linuxGpuDecision.enable && linuxGpuDecision.reason !== 'already-enabled'
 
   if (linuxGpuDecision.enable && linuxGpuDecision.reason !== 'already-enabled' && !LINUX_GPU_SOFTWARE_ACTIVE) {
     app.disableHardwareAcceleration()
@@ -1005,6 +1028,13 @@ if (process.platform === 'linux') {
         'hardware acceleration after a GPU-child init failure (#124843). HERMES_DESKTOP_DISABLE_GPU=0 to opt out.'
     )
   }
+
+  gpuLaunchRecorder.record('start', {
+    mode: LINUX_GPU_SOFTWARE_ACTIVE || linuxGpuFallbackActive ? 'software' : 'hardware',
+    ladder: NVIDIA_EGL_FALLBACK.enable ? 'nvidia-swiftshader' : linuxGpuFallbackActive ? 'disable-gpu' : undefined,
+    app: app.getVersion(),
+    driver: NVIDIA_DRIVER_VERSION ?? undefined
+  })
 }
 
 // Linux: point Chromium at the session's keychain backend so safeStorage can
@@ -1174,19 +1204,20 @@ if (IS_WINDOWS || process.platform === 'linux') {
       return
     }
 
+    if (path === 'disable-gpu' && !gpuDeathCountsAsEvidence()) {
+      console.warn(
+        `[hermes] Linux GPU child gone long after boot (reason=${details?.reason}); not recording fallback evidence`
+      )
+
+      return
+    }
+
     if (path === 'disable-gpu') {
       linuxGpuRelaunchAttempted = true
       linuxGpuFallbackActive = true
       linuxGpuFallbackSticky = true
 
-      const reason =
-        String(details?.reason || '').toLowerCase() === 'launch-failure' ? 'gpu-launch-failure' : 'gpu-crash'
-
-      try {
-        writeLinuxGpuMarker(app.getPath('userData'), linuxGpuFallbackMarker(reason, app.getVersion()))
-      } catch {
-        void 0
-      }
+      gpuLaunchRecorder.record('gpu-death', { reason: String(details?.reason ?? ''), exitCode: details?.exitCode })
 
       console.warn(
         `[hermes] Linux GPU child gone (reason=${details?.reason}); relaunching once with --disable-gpu (#124843)`
@@ -1267,6 +1298,7 @@ const isPrimaryInstance: boolean = acquireSingleInstanceLock()
 
 if (!isPrimaryInstance) {
   console.error('[hermes] another Hermes Desktop instance holds the single-instance lock; exiting')
+  gpuLaunchRecorder.record('second-instance')
   app.exit(0)
 }
 
@@ -13735,22 +13767,12 @@ function createWindow() {
       // window is on screen (a STARTING gnome-shell app must not see its entry change).
       notifyLauncherWindowRevealed()
 
-      // #124255: the first revealed window means the GPU survived this boot.
-      // Keep a sticky SwiftShader marker when we launched with the fallback;
-      // otherwise mark the probe healthy so future launches trust hardware GL.
-      if (NVIDIA_DRIVER_MAJOR !== null) {
-        try {
-          writeNvidiaEglMarker(
-            app.getPath('userData'),
-            nvidiaEglMarkerAfterSuccessfulBoot({
-              fallbackActive: nvidiaEglFallbackActive,
-              appVersion: app.getVersion(),
-              driverVersion: NVIDIA_DRIVER_VERSION
-            })
-          )
-        } catch {
-          void 0
-        }
+      // talos-hq/hermes-slim#6: the first revealed window means the GPU
+      // survived this boot; the ledger counts this launch healthy from here,
+      // so a later force-kill is not GPU evidence.
+      if (gpuBootRevealedAt === null) {
+        gpuBootRevealedAt = Date.now()
+        gpuLaunchRecorder.record('revealed')
       }
 
       // #38216/#121954: clear the mid-boot marker only after a window is
@@ -13785,22 +13807,7 @@ function createWindow() {
         }
       }
 
-      // #124843: clear the mid-boot marker only after a window is actually
-      // usable. Keep sticky `fallback` when we launched with software
-      // rendering so the next launch skips the GPU-child retry loop.
       if (process.platform === 'linux') {
-        try {
-          writeLinuxGpuMarker(
-            app.getPath('userData'),
-            linuxGpuMarkerAfterSuccessfulBoot({
-              fallbackActive: linuxGpuFallbackSticky,
-              appVersion: app.getVersion()
-            })
-          )
-        } catch (error) {
-          rememberLog(`[gpu] linux marker update after main-window reveal failed: ${error?.message || error}`)
-        }
-
         // #124843 silent-retry manifestation: the boot "succeeded" (window
         // revealed, marker ok) while a sub-zygote retries GPU init forever —
         // no child-process-gone event ever fires, so the reactive ladder
@@ -13829,15 +13836,7 @@ function createWindow() {
             ) {
               linuxGpuFallbackActive = true
               linuxGpuFallbackSticky = true
-
-              try {
-                writeLinuxGpuMarker(
-                  app.getPath('userData'),
-                  linuxGpuFallbackMarker('gpu-launch-failure', app.getVersion())
-                )
-              } catch {
-                void 0
-              }
+              gpuLaunchRecorder.record('gpu-death', { reason: 'silent-retry' })
 
               console.warn(
                 '[hermes] Linux: no GPU child after window reveal — GPU init is retrying silently; software fallback engaged for the next launch (#124843)'
@@ -18263,14 +18262,9 @@ app.on('before-quit', event => {
     }
   }
 
-  // #124843: a clean quit mid-boot must not trip next-launch --disable-gpu.
-  // Keyed on sticky (not active) so an engaged fallback keeps its marker.
-  if (process.platform === 'linux' && !linuxGpuFallbackSticky) {
-    try {
-      writeLinuxGpuMarker(app.getPath('userData'), linuxGpuMarkerAfterSuccessfulBoot({ fallbackActive: false }))
-    } catch {
-      void 0
-    }
+  // #124843 / talos-hq/hermes-slim#6: a clean quit mid-boot is not GPU evidence.
+  if (process.platform === 'linux') {
+    gpuLaunchRecorder.record('clean-exit')
   }
 
   // The always-on-top overlay isn't a "real" app window; close it so a stray

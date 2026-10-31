@@ -7,14 +7,13 @@
  * threads, repeated `/dev/dri/renderD128` opens, no `--type=gpu-process`,
  * ~350% CPU from launch with no recovery. Chromium never surfaces a fatal,
  * so the app must bound the retry itself: one relaunch into software
- * rendering, then a sticky per-version marker so the next boot goes straight
- * to software. An app update re-probes the GPU once instead of degrading
- * forever.
+ * rendering, recorded in the launch ledger so later boots go straight to
+ * software until the ledger's backoff re-probes the GPU.
  *
  * Deliberately reactive, not proactive: a healthy Mesa/Wayland stack (Brave
  * renders the same node at ~1% CPU) keeps full acceleration. The fallback
- * engages only on a witnessed GPU launch failure/crash, two consecutive
- * mid-boot aborts, or a sticky marker from a prior recovery.
+ * engages only on a witnessed GPU launch failure/crash or a rapid pre-reveal
+ * boot loop recorded in the launch ledger.
  *
  * Skipped when software rendering is already on (remote-display path,
  * NVIDIA SwiftShader path, `HERMES_DESKTOP_DISABLE_GPU=1`, `--disable-gpu`),
@@ -28,12 +27,24 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import type { LedgerGpuDecision } from './linux-gpu-launch-ledger'
 import { alreadyHasDisableGpu, isHermesDesktopGpuOverrideOff } from './windows-stack-cookie-fallback'
 
+/** Legacy single-slot marker, superseded by the launch ledger; deleted at launch. */
 export const LINUX_GPU_FALLBACK_MARKER_FILENAME = 'linux-gpu-fallback.json'
 
-/** Consecutive mid-boot aborts required before falling back to software. */
-export const BOOT_ABORTS_BEFORE_LINUX_GPU_FALLBACK = 2
+export function linuxGpuMarkerPath(userDataDir: string): string {
+  return path.join(String(userDataDir || ''), LINUX_GPU_FALLBACK_MARKER_FILENAME)
+}
+
+/** Remove the legacy marker: its sticky `fallback` never expired on `0.0.0` builds. */
+export function removeLegacyLinuxGpuMarker(userDataDir: string, { rmSync = fs.rmSync } = {}): void {
+  try {
+    rmSync(linuxGpuMarkerPath(userDataDir), { force: true })
+  } catch {
+    void 0
+  }
+}
 
 /**
  * Seconds after the main window reveals before the #124843 silent-retry check
@@ -45,227 +56,56 @@ export const LINUX_GPU_SILENT_RETRY_GRACE_S = 30
 /** `child-process-gone` reasons that witness a broken GPU child. */
 const GPU_FAILURE_REASONS = new Set(['crashed', 'launch-failure'])
 
-export type LinuxGpuMarkerState = 'booting' | 'fallback' | 'ok'
-
-export type LinuxGpuFallbackReason = 'gpu-launch-failure' | 'gpu-crash' | 'boot-loop'
-
-export interface LinuxGpuMarker {
-  state: LinuxGpuMarkerState
-  /** Why the fallback engaged (state === 'fallback'). */
-  reason?: LinuxGpuFallbackReason
-  /** App version that entered fallback — a version change triggers a re-probe. */
-  version?: string
-  /** Consecutive aborted boots observed so far (state === 'booting'). */
-  bootAborts?: number
-  /** This boot is a GPU re-probe after an app update; an abort returns
-   *  straight to fallback instead of restarting the two-strike count. */
-  reprobe?: boolean
-}
-
-export function linuxGpuMarkerPath(userDataDir: string): string {
-  return path.join(String(userDataDir || ''), LINUX_GPU_FALLBACK_MARKER_FILENAME)
-}
-
-const FALLBACK_REASONS: readonly string[] = ['gpu-launch-failure', 'gpu-crash', 'boot-loop']
-
-export function parseLinuxGpuMarker(raw: unknown): LinuxGpuMarker | null {
-  if (!raw || typeof raw !== 'object') {
-    return null
-  }
-
-  const record = raw as Record<string, unknown>
-  const state = record.state
-
-  if (state !== 'booting' && state !== 'fallback' && state !== 'ok') {
-    return null
-  }
-
-  const marker: LinuxGpuMarker = { state }
-
-  if (typeof record.reason === 'string' && FALLBACK_REASONS.includes(record.reason)) {
-    marker.reason = record.reason as LinuxGpuFallbackReason
-  }
-
-  if (typeof record.version === 'string' && record.version) {
-    marker.version = record.version
-  }
-
-  const aborts = Number(record.bootAborts)
-
-  if (Number.isInteger(aborts) && aborts > 0) {
-    marker.bootAborts = aborts
-  }
-
-  if (record.reprobe === true) {
-    marker.reprobe = true
-  }
-
-  return marker
-}
-
-export function readLinuxGpuMarker(
-  userDataDir: string,
-  { readFileSync = fs.readFileSync } = {}
-): LinuxGpuMarker | null {
-  try {
-    const raw = JSON.parse(readFileSync(linuxGpuMarkerPath(userDataDir), 'utf8'))
-
-    return parseLinuxGpuMarker(raw)
-  } catch {
-    return null
-  }
-}
-
-export function writeLinuxGpuMarker(
-  userDataDir: string,
-  marker: LinuxGpuMarker,
-  {
-    mkdirSync = fs.mkdirSync,
-    writeFileSync = fs.writeFileSync
-  }: {
-    mkdirSync?: typeof fs.mkdirSync
-    writeFileSync?: typeof fs.writeFileSync
-  } = {}
-): void {
-  const dir = String(userDataDir || '')
-
-  if (!dir) {
-    return
-  }
-
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(linuxGpuMarkerPath(dir), `${JSON.stringify(marker)}\n`, 'utf8')
-}
-
-export function linuxGpuFallbackMarker(reason: LinuxGpuFallbackReason, appVersion?: string): LinuxGpuMarker {
-  const marker: LinuxGpuMarker = { state: 'fallback', reason }
-
-  if (appVersion) {
-    marker.version = appVersion
-  }
-
-  return marker
-}
-
-/**
- * After the main window is revealed: keep the sticky fallback when we
- * launched with software rendering, otherwise mark a clean boot so future
- * launches trust the GPU again.
- */
-export function linuxGpuMarkerAfterSuccessfulBoot(options: {
-  fallbackActive: boolean
-  appVersion?: string
-}): LinuxGpuMarker {
-  if (!options.fallbackActive) {
-    return { state: 'ok' }
-  }
-
-  return linuxGpuFallbackMarker('gpu-launch-failure', options.appVersion)
-}
-
 export interface LinuxGpuLaunchDecision {
   enable: boolean
   reason: string | null
-  /** Marker to persist immediately, before GPU children start. */
-  nextMarker: LinuxGpuMarker
 }
 
 /**
- * Single launch-time transition: decide whether this Linux launch disables
- * GPU hardware acceleration AND what the marker becomes for crash-detection
- * on the next launch. Same lifecycle as the Windows sandbox fallback:
- * sticky per app version, two-strike boot-loop detection, one post-update
- * re-probe.
+ * Single launch-time decision: whether this Linux launch disables GPU
+ * hardware acceleration. Cross-launch evidence (witnessed GPU-child deaths,
+ * rapid pre-reveal boot loops, re-probe backoff) comes from the launch ledger
+ * — see linux-gpu-launch-ledger.ts and talos-hq/hermes-slim#6.
  */
 export function decideLinuxGpuLaunch(
   options: {
     platform?: NodeJS.Platform | string
     argv?: readonly string[]
     env?: NodeJS.ProcessEnv
-    marker?: LinuxGpuMarker | null
-    appVersion?: string
+    ledger?: LedgerGpuDecision | null
     remoteDisplayReason?: string | null
     nvidiaFallbackActive?: boolean
   } = {}
 ): LinuxGpuLaunchDecision {
-  const appVersion = String(options.appVersion || '')
+  const off: LinuxGpuLaunchDecision = { enable: false, reason: null }
 
   if ((options.platform ?? process.platform) !== 'linux') {
-    return { enable: false, reason: null, nextMarker: { state: 'booting' } }
+    return off
   }
 
   const argv = options.argv ?? process.argv
   const env = options.env ?? process.env
-  const marker = options.marker ?? null
 
-  // A user who forced GPU back on owns that call — even over a sticky marker. That boot is
-  // the recovery path this file documents, so it must not leave the stale fallback marker
-  // behind: keeping it makes `main.ts` sticky again, the next override-free launch re-engages
-  // software rendering (`sticky-fallback`) and only an app-version change would clear it.
+  // A user who forced GPU back on owns that call — even over ledger evidence.
   if (isHermesDesktopGpuOverrideOff(env)) {
-    return { enable: false, reason: null, nextMarker: { state: 'booting' } }
+    return off
   }
 
   if (alreadyHasDisableGpu(argv, env)) {
-    // Honor the explicit flag; keep the marker lifecycle unchanged. When the
-    // relaunch path set the flag, the fallback marker it wrote is preserved.
-    const nextMarker: LinuxGpuMarker = marker?.state === 'fallback' ? marker : { state: 'booting' }
-
-    return { enable: true, reason: 'already-enabled', nextMarker }
+    return { enable: true, reason: 'already-enabled' }
   }
 
   // The remote-display and NVIDIA paths already force software rendering;
   // don't pile a second fallback on top of theirs.
   if (options.remoteDisplayReason || options.nvidiaFallbackActive) {
-    return { enable: false, reason: null, nextMarker: { state: 'booting' } }
+    return off
   }
 
-  if (marker?.state === 'fallback') {
-    if (marker.version && appVersion && marker.version !== appVersion) {
-      // App updated since the fallback engaged — re-probe the GPU once.
-      return {
-        enable: false,
-        reason: null,
-        nextMarker: { state: 'booting', reprobe: true, bootAborts: 0 }
-      }
-    }
-
-    return {
-      enable: true,
-      reason: `sticky-fallback (${marker.reason ?? 'gpu-launch-failure'})`,
-      nextMarker: { ...marker, version: marker.version || appVersion || undefined }
-    }
+  if (options.ledger?.software) {
+    return { enable: true, reason: options.ledger.reason }
   }
 
-  if (marker?.state === 'booting') {
-    const abortsObserved = (marker.bootAborts ?? 0) + 1
-
-    if (marker.reprobe) {
-      // The one post-update GPU re-probe aborted → back to fallback.
-      return {
-        enable: true,
-        reason: 'reprobe-failed (boot-loop)',
-        nextMarker: linuxGpuFallbackMarker('boot-loop', appVersion)
-      }
-    }
-
-    if (abortsObserved >= BOOT_ABORTS_BEFORE_LINUX_GPU_FALLBACK) {
-      return {
-        enable: true,
-        reason: 'boot-loop',
-        nextMarker: linuxGpuFallbackMarker('boot-loop', appVersion)
-      }
-    }
-
-    return {
-      enable: false,
-      reason: null,
-      nextMarker: { state: 'booting', bootAborts: abortsObserved }
-    }
-  }
-
-  // No marker, or a clean `ok` from the previous run.
-  return { enable: false, reason: null, nextMarker: { state: 'booting' } }
+  return off
 }
 
 /**
